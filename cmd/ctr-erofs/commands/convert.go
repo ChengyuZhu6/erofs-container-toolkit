@@ -35,7 +35,8 @@ import (
 	"github.com/urfave/cli/v2"
 )
 
-// ConvertCommand converts an image
+var buildToolIdentifier = "AWS SOCI CLI v0.2"
+
 var ConvertCommand = &cli.Command{
 	Name:      "convert",
 	Usage:     "convert an image",
@@ -48,7 +49,6 @@ Use '--platform' to define the output platform.
 When '--all-platforms' is given all images in a manifest list must be available.
 `,
 	Flags: []cli.Flag{
-		// erofs flags
 		&cli.BoolFlag{
 			Name:  "erofs",
 			Usage: "Convert docker or OCI layers to EROFS native layers. Should be used in conjunction with '--oci'",
@@ -61,7 +61,6 @@ When '--all-platforms' is given all images in a manifest list must be available.
 			Name:  "erofs-mkfs-options",
 			Usage: "Extra mkfs options applied when converting EROFS layers. (e.g. '-Efragments,dedupe')",
 		},
-		// generic flags
 		&cli.BoolFlag{
 			Name:  "uncompress",
 			Usage: "Convert tar.gz layers to uncompressed tar layers",
@@ -80,6 +79,20 @@ When '--all-platforms' is given all images in a manifest list must be available.
 			Name:  "all-platforms",
 			Usage: "Exports content from all platforms",
 		},
+		&cli.BoolFlag{
+			Name:  "soci",
+			Usage: "Convert docker or OCI layers to SOCI index.",
+		},
+		&cli.Int64Flag{
+			Name:  "spanSizeFlag",
+			Usage: "Span size that soci index uses to segment layer data. Default is 4 MiB",
+			Value: 1 << 22,
+		},
+		&cli.Int64Flag{
+			Name:  "minLayerSizeFlag",
+			Usage: "Minimum layer size to build zTOC for. Smaller layers won't have zTOC and not lazy pulled. Default is 10 MiB.",
+			Value: 10 << 20,
+		},
 	},
 	Action: func(context *cli.Context) error {
 		var convertOpts []converter.Opt
@@ -87,55 +100,6 @@ When '--all-platforms' is given all images in a manifest list must be available.
 		targetRef := context.Args().Get(1)
 		if srcRef == "" || targetRef == "" {
 			return errors.New("src and target image need to be specified")
-		}
-
-		var platformMC platforms.MatchComparer
-		if context.Bool("all-platforms") {
-			platformMC = platforms.All
-		} else {
-			if pss := context.StringSlice("platform"); len(pss) > 0 {
-				var all []ocispec.Platform
-				for _, ps := range pss {
-					p, err := platforms.Parse(ps)
-					if err != nil {
-						return fmt.Errorf("invalid platform %q: %w", ps, err)
-					}
-					all = append(all, p)
-				}
-				platformMC = platforms.Ordered(all...)
-			} else {
-				platformMC = platforms.DefaultStrict()
-			}
-		}
-		convertOpts = append(convertOpts, converter.WithPlatform(platformMC))
-
-		var layerConvertFunc converter.ConvertFunc
-		var finalize func(ctx gocontext.Context, cs content.Store, ref string, desc *ocispec.Descriptor) (*images.Image, error)
-		if context.Bool("erofs") {
-			Opts := []convert.Option{
-				convert.WithCompressors(context.String("erofs-compressors")),
-				convert.WithExtraMkfsOption(context.String("erofs-mkfs-options")),
-			}
-
-			layerConvertFunc = convert.LayerConvertFunc(Opts...)
-			if !context.Bool("oci") {
-				log.L.Warn("option --erofs should be used in conjunction with --oci")
-			}
-			if context.Bool("uncompress") {
-				return errors.New("option --erofs conflicts with --uncompress")
-			}
-		}
-
-		if context.Bool("uncompress") {
-			layerConvertFunc = uncompress.LayerConvertFunc
-		}
-
-		if context.Bool("oci") {
-			convertOpts = append(convertOpts, converter.WithDockerToOCI(true))
-		}
-
-		if layerConvertFunc != nil {
-			convertOpts = append(convertOpts, converter.WithLayerConvertFunc(layerConvertFunc))
 		}
 
 		client, ctx, cancel, err := commands.NewClient(context)
@@ -150,21 +114,62 @@ When '--all-platforms' is given all images in a manifest list must be available.
 		}
 		defer done(ctx)
 
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, os.Interrupt)
-		go func() {
-			// Cleanly cancel conversion
-			select {
-			case s := <-sigCh:
-				log.G(ctx).Infof("Got %v", s)
-				cancel()
-			case <-ctx.Done():
+		platformMC, err := setupPlatformMatching(context)
+		if err != nil {
+			return err
+		}
+		convertOpts = append(convertOpts, converter.WithPlatform(platformMC))
+
+		setupSignalHandling(ctx, cancel)
+
+		if context.Bool("oci") {
+			convertOpts = append(convertOpts, converter.WithDockerToOCI(true))
+		}
+
+		var layerConvertFunc converter.ConvertFunc
+		var finalize func(ctx gocontext.Context, cs content.Store, ref string, desc *ocispec.Descriptor) (*images.Image, error)
+
+		if context.Bool("erofs") {
+			if context.Bool("uncompress") {
+				return errors.New("option --erofs conflicts with --uncompress")
 			}
-		}()
+
+			if !context.Bool("oci") {
+				log.L.Warn("option --erofs should be used in conjunction with --oci")
+			}
+
+			Opts := []convert.Option{
+				convert.WithCompressors(context.String("erofs-compressors")),
+				convert.WithExtraMkfsOption(context.String("erofs-mkfs-options")),
+			}
+			layerConvertFunc = convert.LayerConvertFunc(Opts...)
+		} else if context.Bool("soci") {
+			spanSize := context.Int64("spanSizeFlag")
+			minLayerSize := context.Int64("minLayerSizeFlag")
+
+			layerConvertFunc = convert.SociConvertFunc(
+				convert.WithSociSpanSize(spanSize),
+				convert.WithSociMinLayerSize(minLayerSize),
+			)
+
+			finalize = convert.SociImageConvertFunc(
+				client,
+				convert.WithSociSpanSize(spanSize),
+				convert.WithSociMinLayerSize(minLayerSize),
+			)
+		} else if context.Bool("uncompress") {
+			layerConvertFunc = uncompress.LayerConvertFunc
+		}
+
+		if layerConvertFunc != nil {
+			convertOpts = append(convertOpts, converter.WithLayerConvertFunc(layerConvertFunc))
+		}
+
 		newImg, err := converter.Convert(ctx, client, targetRef, srcRef, convertOpts...)
 		if err != nil {
 			return err
 		}
+
 		if finalize != nil {
 			newI, err := finalize(ctx, client.ContentStore(), targetRef, &newImg.Target)
 			if err != nil {
@@ -178,7 +183,41 @@ When '--all-platforms' is given all images in a manifest list must be available.
 			}
 			fmt.Fprintln(context.App.Writer, "extra image:", finimg.Name)
 		}
+
 		fmt.Fprintln(context.App.Writer, newImg.Target.Digest.String())
 		return nil
 	},
+}
+
+func setupPlatformMatching(context *cli.Context) (platforms.MatchComparer, error) {
+	if context.Bool("all-platforms") {
+		return platforms.All, nil
+	}
+
+	if pss := context.StringSlice("platform"); len(pss) > 0 {
+		var all []ocispec.Platform
+		for _, ps := range pss {
+			p, err := platforms.Parse(ps)
+			if err != nil {
+				return nil, fmt.Errorf("invalid platform %q: %w", ps, err)
+			}
+			all = append(all, p)
+		}
+		return platforms.Ordered(all...), nil
+	}
+
+	return platforms.DefaultStrict(), nil
+}
+
+func setupSignalHandling(ctx gocontext.Context, cancel func()) {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
+	go func() {
+		select {
+		case s := <-sigCh:
+			log.G(ctx).Infof("Got %v", s)
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 }
