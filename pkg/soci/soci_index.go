@@ -571,32 +571,37 @@ func zinfoToFlatbuffer(ztoc *ztoc.Ztoc) (fb []byte, err error) {
 		}
 	}()
 
-	if ztoc == nil {
-		return nil, fmt.Errorf("ztoc is nil")
-	}
-	if ztoc.Checkpoints == nil {
-		return nil, fmt.Errorf("ztoc.Checkpoints is nil")
-	}
-	if ztoc.SpanDigests == nil {
-		return nil, fmt.Errorf("ztoc.SpanDigests is nil")
-	}
+	// 打印输入数据统计信息
+	fmt.Printf("zinfoToFlatbuffer: Checkpoints size: %d bytes\n", len(ztoc.Checkpoints))
+	fmt.Printf("zinfoToFlatbuffer: SpanDigests count: %d\n", len(ztoc.SpanDigests))
+	fmt.Printf("zinfoToFlatbuffer: MaxSpanID: %d\n", ztoc.MaxSpanID)
+	fmt.Printf("zinfoToFlatbuffer: CompressionAlgorithm: %s\n", ztoc.CompressionAlgorithm)
+	fmt.Printf("zinfoToFlatbuffer: CompressedArchiveSize: %d\n", ztoc.CompressedArchiveSize)
+	fmt.Printf("zinfoToFlatbuffer: UncompressedArchiveSize: %d\n", ztoc.UncompressedArchiveSize)
+
 	builder := flatbuffers.NewBuilder(0)
-	fmt.Printf("NewBuilder\n")
+	fmt.Printf("zinfoToFlatbuffer: NewBuilder created\n")
+
 	checkpointsVector := builder.CreateByteVector(ztoc.Checkpoints)
-	fmt.Printf("CreateByteVector\n")
+	fmt.Printf("zinfoToFlatbuffer: CreateByteVector completed\n")
 
 	spanDigestsOffsets := make([]flatbuffers.UOffsetT, 0, len(ztoc.SpanDigests))
-	for _, spanDigest := range ztoc.SpanDigests {
+	for i, spanDigest := range ztoc.SpanDigests {
 		off := builder.CreateString(spanDigest.String())
 		spanDigestsOffsets = append(spanDigestsOffsets, off)
+		if i < 5 { // 只打印前5个digest
+			fmt.Printf("zinfoToFlatbuffer: SpanDigest[%d]: %s\n", i, spanDigest.String())
+		}
 	}
-	fmt.Printf("spanDigestsOffsets\n")
+	fmt.Printf("zinfoToFlatbuffer: Created %d span digest offsets\n", len(spanDigestsOffsets))
+
 	ztoc_flatbuffers.CompressionInfoStartSpanDigestsVector(builder, len(spanDigestsOffsets))
 	for i := len(spanDigestsOffsets) - 1; i >= 0; i-- {
 		builder.PrependUOffsetT(spanDigestsOffsets[i])
 	}
 	spanDigests := builder.EndVector(len(spanDigestsOffsets))
-	fmt.Printf("spanDigests\n")
+	fmt.Printf("zinfoToFlatbuffer: SpanDigests vector created\n")
+
 	ztoc_flatbuffers.CompressionInfoStart(builder)
 	ztoc_flatbuffers.CompressionInfoAddMaxSpanId(builder, int32(ztoc.MaxSpanID))
 	ztoc_flatbuffers.CompressionInfoAddSpanDigests(builder, spanDigests)
@@ -610,16 +615,22 @@ func zinfoToFlatbuffer(ztoc *ztoc.Ztoc) (fb []byte, err error) {
 			return nil, err
 		}
 		ztoc_flatbuffers.CompressionInfoAddCompressionAlgorithm(builder, compressionAlgorithm)
+		fmt.Printf("zinfoToFlatbuffer: Added compression algorithm: %s\n", ztoc.CompressionAlgorithm)
 	}
 	ztocInfo := ztoc_flatbuffers.CompressionInfoEnd(builder)
-	fmt.Printf("CompressionInfoEnd\n")
-	builder.StartObject(3)
-	builder.PrependInt64Slot(0, int64(ztoc.CompressedArchiveSize), 0)
-	builder.PrependInt64Slot(1, int64(ztoc.UncompressedArchiveSize), 0)
-	builder.PrependUOffsetTSlot(2, flatbuffers.UOffsetT(ztocInfo), 0)
+	fmt.Printf("zinfoToFlatbuffer: CompressionInfoEnd completed\n")
+
+	ztoc_flatbuffers.ZtocStart(builder)
+	builder.PrependInt64Slot(2, int64(ztoc.CompressedArchiveSize), 0)
+	builder.PrependInt64Slot(3, int64(ztoc.UncompressedArchiveSize), 0)
+	builder.PrependUOffsetTSlot(5, flatbuffers.UOffsetT(ztocInfo), 0)
 	builder.Finish(builder.EndObject())
-	fmt.Printf("FinishedBytes\n")
-	return builder.FinishedBytes(), nil
+	fmt.Printf("zinfoToFlatbuffer: Object finished\n")
+
+	result := builder.FinishedBytes()
+	fmt.Printf("zinfoToFlatbuffer: Serialized size: %d bytes\n", len(result))
+
+	return result, nil
 }
 
 // buildSociLayer builds a ztoc for an image layer (`desc`) and returns ztoc descriptor.
@@ -678,7 +689,6 @@ func (b *IndexBuilder) buildSociLayer(ctx context.Context, desc ocispec.Descript
 	}
 	fmt.Printf("CompressedArchiveSize: %+v\n", toc.CompressedArchiveSize)
 	fmt.Printf("UncompressedArchiveSize: %+v\n", toc.UncompressedArchiveSize)
-	fmt.Printf("zinfo: %+v\n", toc.CompressionInfo)
 	fmt.Printf("layer %s -> erofsmetadata+ zinfo\n", desc.Digest)
 	zinfofile := desc.Digest.String() + ".zinfo"
 	zinfoPath := path.Join(os.TempDir(), zinfofile)
@@ -687,7 +697,22 @@ func (b *IndexBuilder) buildSociLayer(ctx context.Context, desc ocispec.Descript
 		return nil, err
 	}
 
+	// 验证序列化结果
+	fmt.Printf("validateZinfoSerialization\n")
+	if err := validateZinfoSerialization(toc, flatbuf); err != nil {
+		return nil, fmt.Errorf("zinfo serialization validation failed: %w", err)
+	}
+
 	err = os.WriteFile(zinfoPath, flatbuf, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to write zinfo file: %w", err)
+	}
+	fmt.Printf("verifyZinfoFile\n")
+
+	// 验证写入的文件
+	if err := verifyZinfoFile(zinfoPath, flatbuf); err != nil {
+		return nil, fmt.Errorf("zinfo file verification failed: %w", err)
+	}
 
 	ConvertTarErofsZinfo(ctx, sr, desc.Digest.String()+".meta", tmpFile.Name(), []string{"--gzinfo=" + zinfoPath})
 
@@ -727,7 +752,7 @@ func (b *IndexBuilder) buildSociLayer(ctx context.Context, desc ocispec.Descript
 }
 
 func ConvertTarErofsZinfo(ctx context.Context, r io.Reader, layermeta, layerpath string, mkfsExtraOpts []string) error {
-	args := append([]string{"--tar=i"}, mkfsExtraOpts...)
+	args := append([]string{"--tar=i", "--quiet"}, mkfsExtraOpts...)
 	args = append(args, layermeta)
 	args = append(args, layerpath)
 	cmd := exec.CommandContext(ctx, "mkfs.erofs", args...)
@@ -890,4 +915,114 @@ func shouldDisableXattrs(ztoc *ztoc.Ztoc) bool {
 	}
 
 	return true
+}
+
+func validateZinfoSerialization(original *ztoc.Ztoc, serialized []byte) error {
+	if original == nil {
+		return fmt.Errorf("original ztoc is nil")
+	}
+	if len(serialized) == 0 {
+		return fmt.Errorf("serialized data is empty")
+	}
+	if len(serialized) < 8 {
+		return fmt.Errorf("serialized data too small: %d bytes", len(serialized))
+	}
+
+	// Parse flatbuffer
+	z := ztoc_flatbuffers.GetRootAsZtoc(serialized, 0)
+
+	// Compare top-level sizes
+	if int64(original.CompressedArchiveSize) != z.CompressedArchiveSize() {
+		return fmt.Errorf("CompressedArchiveSize mismatch: got %d, want %d", z.CompressedArchiveSize(), int64(original.CompressedArchiveSize))
+	}
+	if int64(original.UncompressedArchiveSize) != z.UncompressedArchiveSize() {
+		return fmt.Errorf("UncompressedArchiveSize mismatch: got %d, want %d", z.UncompressedArchiveSize(), int64(original.UncompressedArchiveSize))
+	}
+
+	// Read nested CompressionInfo
+	var ci ztoc_flatbuffers.CompressionInfo
+	if z.CompressionInfo(&ci) == nil {
+		return fmt.Errorf("missing CompressionInfo in flatbuffer")
+	}
+
+	// MaxSpanID
+	if int32(original.MaxSpanID) != ci.MaxSpanId() {
+		return fmt.Errorf("MaxSpanID mismatch: got %d, want %d", ci.MaxSpanId(), int32(original.MaxSpanID))
+	}
+
+	// Checkpoints: compare length and a hash/equality
+	cpLen := ci.CheckpointsLength()
+	if cpLen != len(original.Checkpoints) {
+		return fmt.Errorf("Checkpoints length mismatch: got %d, want %d", cpLen, len(original.Checkpoints))
+	}
+	// Compare a few sentinel bytes and, if small, full content
+	compareFull := len(original.Checkpoints) <= 1<<20 // up to 1 MiB
+	if compareFull {
+		for i := 0; i < cpLen; i++ {
+			if ci.Checkpoints(i) != original.Checkpoints[i] {
+				return fmt.Errorf("Checkpoints byte mismatch at %d: got %d, want %d", i, ci.Checkpoints(i), original.Checkpoints[i])
+			}
+		}
+	} else {
+		for _, idx := range []int{0, cpLen / 2, cpLen - 1} {
+			if idx >= 0 && idx < cpLen {
+				if ci.Checkpoints(idx) != original.Checkpoints[idx] {
+					return fmt.Errorf("Checkpoints sentinel mismatch at %d: got %d, want %d", idx, ci.Checkpoints(idx), original.Checkpoints[idx])
+				}
+			}
+		}
+	}
+
+	// SpanDigests: compare count and values
+	spanCount := ci.SpanDigestsLength()
+	if spanCount != len(original.SpanDigests) {
+		return fmt.Errorf("SpanDigests count mismatch: got %d, want %d", spanCount, len(original.SpanDigests))
+	}
+	for i := 0; i < spanCount; i++ {
+		got := string(ci.SpanDigests(i))
+		want := original.SpanDigests[i].String()
+		if got != want {
+			return fmt.Errorf("SpanDigests[%d] mismatch: got %q, want %q", i, got, want)
+		}
+	}
+
+	// CompressionAlgorithm: only verify if explicitly set in original
+	if original.CompressionAlgorithm != "" {
+		enumVal, err := compressionAlgorithmToFlatbuf(original.CompressionAlgorithm)
+		if err != nil {
+			return err
+		}
+		if ci.CompressionAlgorithm() != enumVal {
+			return fmt.Errorf("CompressionAlgorithm mismatch: got %v, want %v", ci.CompressionAlgorithm(), enumVal)
+		}
+	}
+
+	return nil
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func verifyZinfoFile(filePath string, expectedData []byte) error {
+	// 读取文件并比较
+	actualData, err := os.ReadFile(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to read zinfo file: %w", err)
+	}
+
+	if len(actualData) != len(expectedData) {
+		return fmt.Errorf("file size mismatch: expected %d, got %d", len(expectedData), len(actualData))
+	}
+
+	// 比较内容（可选，对于大文件可能比较慢）
+	if !bytes.Equal(actualData, expectedData) {
+		return fmt.Errorf("file content mismatch")
+	}
+
+	fmt.Printf("verifyZinfoFile: File verification successful, size: %d bytes\n", len(actualData))
+	return nil
 }
