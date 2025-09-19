@@ -614,9 +614,9 @@ func zinfoToFlatbuffer(ztoc *ztoc.Ztoc) (fb []byte, err error) {
 	ztocInfo := ztoc_flatbuffers.CompressionInfoEnd(builder)
 	fmt.Printf("CompressionInfoEnd\n")
 	builder.StartObject(3)
-	ztoc_flatbuffers.ZtocAddCompressedArchiveSize(builder, int64(ztoc.CompressedArchiveSize))
-	ztoc_flatbuffers.ZtocAddUncompressedArchiveSize(builder, int64(ztoc.UncompressedArchiveSize))
-	ztoc_flatbuffers.ZtocAddCompressionInfo(builder, ztocInfo)
+	builder.PrependInt64Slot(0, int64(ztoc.CompressedArchiveSize), 0)
+	builder.PrependInt64Slot(1, int64(ztoc.UncompressedArchiveSize), 0)
+	builder.PrependUOffsetTSlot(2, flatbuffers.UOffsetT(ztocInfo), 0)
 	builder.Finish(builder.EndObject())
 	fmt.Printf("FinishedBytes\n")
 	return builder.FinishedBytes(), nil
@@ -676,7 +676,9 @@ func (b *IndexBuilder) buildSociLayer(ctx context.Context, desc ocispec.Descript
 	if err != nil {
 		return nil, err
 	}
-
+	fmt.Printf("CompressedArchiveSize: %+v\n", toc.CompressedArchiveSize)
+	fmt.Printf("UncompressedArchiveSize: %+v\n", toc.UncompressedArchiveSize)
+	fmt.Printf("zinfo: %+v\n", toc.CompressionInfo)
 	fmt.Printf("layer %s -> erofsmetadata+ zinfo\n", desc.Digest)
 	zinfofile := desc.Digest.String() + ".zinfo"
 	zinfoPath := path.Join(os.TempDir(), zinfofile)
@@ -734,7 +736,7 @@ func ConvertTarErofsZinfo(ctx context.Context, r io.Reader, layermeta, layerpath
 	if err != nil {
 		return fmt.Errorf("mkfs.erofs %s failed: %s: %w", cmd.Args, out, err)
 	}
-	log.G(ctx).Debugf("running %s %s %v", cmd.Path, cmd.Args, string(out))
+	fmt.Printf("running %s %s %v", cmd.Path, cmd.Args, string(out))
 	return nil
 }
 
