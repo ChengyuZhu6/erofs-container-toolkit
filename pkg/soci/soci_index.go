@@ -567,23 +567,36 @@ func zinfoToFlatbuffer(ztoc *ztoc.Ztoc) (fb []byte, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			fb = nil
-			err = fmt.Errorf("cannot marshal Ztoc to flatbuffers")
+			err = fmt.Errorf("cannot marshal Ztoc to flatbuffers: %v", r)
 		}
 	}()
 
+	if ztoc == nil {
+		return nil, fmt.Errorf("ztoc is nil")
+	}
+	if ztoc.Checkpoints == nil {
+		return nil, fmt.Errorf("ztoc.Checkpoints is nil")
+	}
+	if ztoc.SpanDigests == nil {
+		return nil, fmt.Errorf("ztoc.SpanDigests is nil")
+	}
 	builder := flatbuffers.NewBuilder(0)
+	fmt.Printf("NewBuilder\n")
 	checkpointsVector := builder.CreateByteVector(ztoc.Checkpoints)
+	fmt.Printf("CreateByteVector\n")
+
 	spanDigestsOffsets := make([]flatbuffers.UOffsetT, 0, len(ztoc.SpanDigests))
 	for _, spanDigest := range ztoc.SpanDigests {
 		off := builder.CreateString(spanDigest.String())
 		spanDigestsOffsets = append(spanDigestsOffsets, off)
 	}
+	fmt.Printf("spanDigestsOffsets\n")
 	ztoc_flatbuffers.CompressionInfoStartSpanDigestsVector(builder, len(spanDigestsOffsets))
 	for i := len(spanDigestsOffsets) - 1; i >= 0; i-- {
 		builder.PrependUOffsetT(spanDigestsOffsets[i])
 	}
 	spanDigests := builder.EndVector(len(spanDigestsOffsets))
-
+	fmt.Printf("spanDigests\n")
 	ztoc_flatbuffers.CompressionInfoStart(builder)
 	ztoc_flatbuffers.CompressionInfoAddMaxSpanId(builder, int32(ztoc.MaxSpanID))
 	ztoc_flatbuffers.CompressionInfoAddSpanDigests(builder, spanDigests)
@@ -599,11 +612,13 @@ func zinfoToFlatbuffer(ztoc *ztoc.Ztoc) (fb []byte, err error) {
 		ztoc_flatbuffers.CompressionInfoAddCompressionAlgorithm(builder, compressionAlgorithm)
 	}
 	ztocInfo := ztoc_flatbuffers.CompressionInfoEnd(builder)
+	fmt.Printf("CompressionInfoEnd\n")
 	builder.StartObject(3)
 	ztoc_flatbuffers.ZtocAddCompressedArchiveSize(builder, int64(ztoc.CompressedArchiveSize))
 	ztoc_flatbuffers.ZtocAddUncompressedArchiveSize(builder, int64(ztoc.UncompressedArchiveSize))
 	ztoc_flatbuffers.ZtocAddCompressionInfo(builder, ztocInfo)
 	builder.Finish(builder.EndObject())
+	fmt.Printf("FinishedBytes\n")
 	return builder.FinishedBytes(), nil
 }
 
