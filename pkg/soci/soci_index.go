@@ -24,6 +24,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,15 +33,16 @@ import (
 
 	"github.com/awslabs/soci-snapshotter/ztoc"
 	"github.com/awslabs/soci-snapshotter/ztoc/compression"
+	ztoc_flatbuffers "github.com/awslabs/soci-snapshotter/ztoc/fbs/ztoc"
 	"github.com/containerd/containerd/v2/core/content"
-	"github.com/containerd/errdefs"
-	"oras.land/oras-go/v2/errdef"
-
 	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
 	"github.com/containerd/platforms"
+	flatbuffers "github.com/google/flatbuffers/go"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"oras.land/oras-go/v2/errdef"
 )
 
 const (
@@ -551,6 +554,59 @@ func (b *IndexBuilder) build(ctx context.Context, img images.Image, buildCfg bui
 	}, nil
 }
 
+func compressionAlgorithmToFlatbuf(algo string) (ztoc_flatbuffers.CompressionAlgorithm, error) {
+	for k, v := range ztoc_flatbuffers.EnumValuesCompressionAlgorithm {
+		if strings.ToLower(k) == algo {
+			return v, nil
+		}
+	}
+	return 0, fmt.Errorf("compression algorithm not defined in flatbuf: %s", algo)
+}
+
+func zinfoToFlatbuffer(ztoc *ztoc.Ztoc) (fb []byte, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			fb = nil
+			err = fmt.Errorf("cannot marshal Ztoc to flatbuffers")
+		}
+	}()
+
+	builder := flatbuffers.NewBuilder(0)
+	checkpointsVector := builder.CreateByteVector(ztoc.Checkpoints)
+	spanDigestsOffsets := make([]flatbuffers.UOffsetT, 0, len(ztoc.SpanDigests))
+	for _, spanDigest := range ztoc.SpanDigests {
+		off := builder.CreateString(spanDigest.String())
+		spanDigestsOffsets = append(spanDigestsOffsets, off)
+	}
+	ztoc_flatbuffers.CompressionInfoStartSpanDigestsVector(builder, len(spanDigestsOffsets))
+	for i := len(spanDigestsOffsets) - 1; i >= 0; i-- {
+		builder.PrependUOffsetT(spanDigestsOffsets[i])
+	}
+	spanDigests := builder.EndVector(len(spanDigestsOffsets))
+
+	ztoc_flatbuffers.CompressionInfoStart(builder)
+	ztoc_flatbuffers.CompressionInfoAddMaxSpanId(builder, int32(ztoc.MaxSpanID))
+	ztoc_flatbuffers.CompressionInfoAddSpanDigests(builder, spanDigests)
+	ztoc_flatbuffers.CompressionInfoAddCheckpoints(builder, checkpointsVector)
+
+	// only add (and check) compression algorithm if not empty;
+	// if empty, use Gzip as defined in ztoc flatbuf.
+	if ztoc.CompressionAlgorithm != "" {
+		compressionAlgorithm, err := compressionAlgorithmToFlatbuf(ztoc.CompressionAlgorithm)
+		if err != nil {
+			return nil, err
+		}
+		ztoc_flatbuffers.CompressionInfoAddCompressionAlgorithm(builder, compressionAlgorithm)
+	}
+	ztocInfo := ztoc_flatbuffers.CompressionInfoEnd(builder)
+	builder.StartObject(3)
+	ztoc_flatbuffers.ZtocAddCompressedArchiveSize(builder, int64(ztoc.CompressedArchiveSize))
+	ztoc_flatbuffers.ZtocAddUncompressedArchiveSize(builder, int64(ztoc.UncompressedArchiveSize))
+	ztoc_flatbuffers.ZtocAddCompressionInfo(builder, ztocInfo)
+	builder.Finish(builder.EndObject())
+	return builder.FinishedBytes(), nil
+}
+
 // buildSociLayer builds a ztoc for an image layer (`desc`) and returns ztoc descriptor.
 // It may skip building ztoc (e.g., if layer size < `minLayerSize`) and return nil.
 // This should be done within a Batch and followed by Label calls to prevent garbage collection.
@@ -606,6 +662,18 @@ func (b *IndexBuilder) buildSociLayer(ctx context.Context, desc ocispec.Descript
 		return nil, err
 	}
 
+	fmt.Printf("layer %s -> erofsmetadata+ zinfo\n", desc.Digest)
+	zinfofile := desc.Digest.String() + ".zinfo"
+	zinfoPath := path.Join(os.TempDir(), zinfofile)
+	flatbuf, err := zinfoToFlatbuffer(toc)
+	if err != nil {
+		return nil, err
+	}
+
+	err = os.WriteFile(zinfoPath, flatbuf, 0644)
+
+	ConvertTarErofsZinfo(ctx, sr, desc.Digest.String()+".meta", tmpFile.Name(), []string{"--gzinfo=" + zinfoPath})
+
 	ztocReader, ztocDesc, err := ztoc.Marshal(toc)
 	if err != nil {
 		return nil, err
@@ -639,6 +707,20 @@ func (b *IndexBuilder) buildSociLayer(ctx context.Context, desc ocispec.Descript
 	}
 	b.maybeAddDisableXattrAnnotation(&ztocDesc, toc)
 	return &ztocDesc, err
+}
+
+func ConvertTarErofsZinfo(ctx context.Context, r io.Reader, layermeta, layerpath string, mkfsExtraOpts []string) error {
+	args := append([]string{"--tar=i"}, mkfsExtraOpts...)
+	args = append(args, layermeta)
+	args = append(args, layerpath)
+	cmd := exec.CommandContext(ctx, "mkfs.erofs", args...)
+	cmd.Stdin = r
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("mkfs.erofs %s failed: %s: %w", cmd.Args, out, err)
+	}
+	log.G(ctx).Debugf("running %s %s %v", cmd.Path, cmd.Args, string(out))
+	return nil
 }
 
 // NewIndex returns a new index.
