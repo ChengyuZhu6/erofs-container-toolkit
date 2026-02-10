@@ -147,7 +147,7 @@ func (a *diffService) getDiffer() (differ, error) {
 	}
 
 	defer atomic.StoreUint32(&a.loaded, 1)
-	a.differ = erofsdiff.NewErofsDiffer(client.ContentStore(), []string{})
+	a.differ = erofsdiff.NewErofsDiffer(client.ContentStore())
 	return a.differ, nil
 }
 
